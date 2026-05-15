@@ -1,0 +1,184 @@
+name: Hourly Copilot Cycle
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: pinkybrain-hourly-copilot-cycle
+  cancel-in-progress: false
+
+jobs:
+  create-hourly-task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: copilot
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Ensure hourly label exists
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const name = 'copilot-hourly';
+
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name });
+              core.info(`Label ${name} already exists.`);
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+
+              await github.rest.issues.createLabel({
+                owner,
+                repo,
+                name,
+                color: '5319e7',
+                description: 'Hourly tasks created for Copilot cloud agent.',
+              });
+              core.info(`Created label ${name}.`);
+            }
+
+      - name: Create and assign the hourly Copilot task
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.COPILOT_AGENT_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const label = 'copilot-hourly';
+            const baseRef =
+              context.payload.repository?.default_branch ??
+              context.ref.replace('refs/heads/', '');
+
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              labels: label,
+              per_page: 100,
+            });
+
+            const existingHourlyIssue = openIssues.find((issue) => !issue.pull_request);
+            if (existingHourlyIssue) {
+              core.notice(`Skipping new task because #${existingHourlyIssue.number} is still open.`);
+              return;
+            }
+
+            const labelData = await github.rest.issues.listLabelsForRepo({
+              owner,
+              repo,
+              per_page: 100,
+            });
+            const hourlyLabel = labelData.data.find((item) => item.name === label);
+
+            if (!hourlyLabel?.node_id) {
+              throw new Error(`Required label ${label} was not found.`);
+            }
+
+            const repoData = await github.graphql(
+              `query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  id
+                  suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 100) {
+                    nodes {
+                      __typename
+                      login
+                      ... on Bot {
+                        id
+                      }
+                      ... on User {
+                        id
+                      }
+                    }
+                  }
+                }
+              }`,
+              {
+                owner,
+                repo,
+                headers: {
+                  'GraphQL-Features': 'issues_copilot_assignment_api_support',
+                },
+              },
+            );
+
+            const repositoryId = repoData.repository.id;
+            const copilot = repoData.repository.suggestedActors.nodes.find(
+              (actor) => actor.login === 'copilot-swe-agent',
+            );
+
+            if (!copilot?.id) {
+              throw new Error(
+                'Copilot cloud agent is not available for this repository. Enable Copilot cloud agent before using this workflow.',
+              );
+            }
+
+            const timestamp = new Date().toISOString().replace(/:\d{2}\.\d{3}Z$/, 'Z');
+            const title = `Hourly Copilot cycle: ${timestamp}`;
+            const body = [
+              '## Goal',
+              'Make one small, durable improvement that helps this repository keep running with minimal human attention.',
+              '',
+              '## Constraints',
+              '- Keep the change narrow and reviewable.',
+              '- Prefer documentation, workflow, or automation hardening improvements.',
+              '- Update related comments and documentation when behavior changes.',
+              '- Do not add paid services, external infrastructure, or secrets-in-code.',
+              '- Open a pull request when the work is done.',
+              '',
+              '## Context',
+              '- Read README.md, PURPOSE.md, design/SPEC.md, and .github/copilot-instructions.md first.',
+              '- This repository is meant to wake once per hour in GitHub Actions and let Copilot do the next small piece of work.',
+              '- If there is no obvious feature to build, improve clarity, safety, or maintainability instead.',
+            ].join('\n');
+
+            const result = await github.graphql(
+              `mutation(
+                $repositoryId: ID!
+                $assigneeId: ID!
+                $title: String!
+                $body: String!
+                $baseRef: String!
+                $labelId: ID!
+              ) {
+                createIssue(
+                  input: {
+                    repositoryId: $repositoryId
+                    title: $title
+                    body: $body
+                    labelIds: [$labelId]
+                    assigneeIds: [$assigneeId]
+                    agentAssignment: {
+                      targetRepositoryId: $repositoryId
+                      baseRef: $baseRef
+                      customInstructions: "Keep the task small, preserve the hourly automation, and open a pull request when complete."
+                    }
+                  }
+                ) {
+                  issue {
+                    number
+                    url
+                  }
+                }
+              }`,
+              {
+                repositoryId,
+                assigneeId: copilot.id,
+                title,
+                body,
+                baseRef,
+                labelId: hourlyLabel.node_id,
+                headers: {
+                  'GraphQL-Features': 'issues_copilot_assignment_api_support',
+                },
+              },
+            );
+
+            core.notice(`Created hourly issue ${result.createIssue.issue.url}.`);
