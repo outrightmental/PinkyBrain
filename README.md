@@ -1,2 +1,3 @@
 # PinkyBrain
-What are we doing tonight, Brain? Tonight we're going to take over the world, Pinky.
+
+> "Brain, what do you want to do tonight? The same thing we do every night, Pinky - try to take over the world!"
